@@ -61,15 +61,16 @@ class PairDistributionFunction(AutoSerialize):
         self.input_data = input_data
         self.device = device
 
-        self._polar_tensor: torch.Tensor | None = None
         self._r: torch.Tensor | None = None
         self._reduced_pdf: torch.Tensor | None = None
         self._pdf: torch.Tensor | None = None
-        self.radial_mean: torch.Tensor | None = None
+        self.Ik: torch.Tensor | None = None
         self.Sk: torch.Tensor | None = None
         self.Fk: torch.Tensor | None = None
         self.bg: torch.Tensor | None = None
         self.Fk_mask: torch.Tensor | None = None
+        self.Fk_damped: torch.Tensor | None = None
+        self.reduced_pdf_damped: torch.Tensor | None = None
         self.rho0: float | None = None
 
     # ------------------------------------------------------------------
@@ -240,10 +241,12 @@ class PairDistributionFunction(AutoSerialize):
         """
         # Polar4dstem dims: (scan_y, scan_x, phi, r)
         # radial axis is 3
+        # origin[3] is the physical q-value at bin 0 (radial_min * pixel_size),
+        # sampling[3] is the physical step per bin (radial_step * pixel_size).
         n = self.polar.shape[3]
         origin_r = float(np.asarray(self.polar.origin)[3])
         sampling_r = float(np.asarray(self.polar.sampling)[3])
-        return (np.arange(n, dtype=float) - origin_r) * sampling_r
+        return np.arange(n, dtype=float) * sampling_r + origin_r
 
     @property
     def radial_bins(self) -> Any:
@@ -251,8 +254,9 @@ class PairDistributionFunction(AutoSerialize):
         Radial bin centers in pixel units (convenience alias).
         """
         n = self.polar.shape[3]
-        origin_r = float(np.asarray(self.polar.origin)[3])
-        return np.arange(n, dtype=float) - origin_r
+        radial_min = float(self.polar.metadata.get("polar_radial_min", 0.0))
+        radial_step = float(self.polar.metadata.get("polar_radial_step", 1.0))
+        return np.arange(n, dtype=float) * radial_step + radial_min
 
     @property
     def r(self) -> NDArray | None:
@@ -306,11 +310,13 @@ class PairDistributionFunction(AutoSerialize):
     # ------------------------------------------------------------------
     @property
     def polar_tensor(self) -> torch.Tensor:
-        if self._polar_tensor is None:
-            self._polar_tensor = torch.from_numpy(self.polar.array.astype(np.float32)).to(
-                device=self.device
-            )
-        return self._polar_tensor
+        """Convert polar array to torch tensor on-the-fly (not cached).
+
+        .. warning::
+            This materialises the entire polar array as a float32 tensor.
+            Prefer chunked access via ``self.polar.array`` for large datasets.
+        """
+        return torch.from_numpy(self.polar.array.astype(np.float32)).to(device=self.device)
 
     def _to_torch(self, arr: NDArray) -> torch.Tensor:
         return torch.from_numpy(arr.astype(np.float32)).to(device=self.device)
@@ -502,6 +508,7 @@ class PairDistributionFunction(AutoSerialize):
         self,
         mask_realspace: NDArray | None = None,
         returnval: bool = False,
+        chunk_rows: int = 16,
     ) -> torch.Tensor | None:
         """
         Calculate the radial mean intensity from the Polar4dSTEM dataset.
@@ -509,10 +516,14 @@ class PairDistributionFunction(AutoSerialize):
         The polar array is assumed to have shape (scan_y, scan_x, phi, k).
         This method computes, for each scan position, the mean over the azimuthal
         axis (phi), then averages across scan positions to produce a single 1D
-        radial curve. This result is stored in ``self.radial_mean``.
+        radial curve. This result is stored in ``self.Ik``.
 
         If a real-space mask is provided, only the selected scan positions are
         used in the scan-position average.
+
+        The computation streams row-chunks through torch to keep peak
+        memory low.  The phi mean is computed *before* mask indexing so the
+        largest intermediate per chunk is only (chunk_rows, scan_x, k).
 
         Parameters
         ----------
@@ -522,6 +533,8 @@ class PairDistributionFunction(AutoSerialize):
             Must have shape (scan_y, scan_x) where True means "include".
         returnval : bool, optional
             If True, return the computed 1D radial mean tensor.
+        chunk_rows : int, optional
+            Number of scan rows to process at a time.
 
         Returns
         -------
@@ -529,21 +542,41 @@ class PairDistributionFunction(AutoSerialize):
             If `returnval=True`, returns the 1D radial mean intensity (Nk,).
             Otherwise returns None.
         """
-        polar_data = self.polar_tensor  # shape: (scan_y, scan_x, phi, k)
-        if mask_realspace is None:
-            # get intensity over q-range for each probe position then average
-            radial_probe = polar_data.mean(dim=2)  # dim 2: theta
-            self.radial_mean = radial_probe.mean(dim=(0, 1))
-        else:
-            mask_torch = torch.from_numpy(mask_realspace).to(device=self.device)
-            masked_polar = polar_data[mask_torch]  # (N_valid, N_theta, N_k)
-            # intensity over q-range of each unmasked probe position
-            radial_probe = masked_polar.mean(dim=1)
-            # average over unmasked probe positions
-            self.radial_mean = radial_probe.mean(dim=0)
+        polar_np = self.polar.array  # shape: (scan_y, scan_x, phi, k)
+        scan_y, scan_x, n_phi, n_k = polar_np.shape
+
+        running_sum = torch.zeros(n_k, device=self.device, dtype=torch.float64)
+        n_valid = 0
+
+        for y0 in range(0, scan_y, chunk_rows):
+            y1 = min(y0 + chunk_rows, scan_y)
+            raw = polar_np[y0:y1]
+            chunk = torch.from_numpy(np.ascontiguousarray(raw)).to(self.device)
+
+            # mean over phi first — (chunk, scan_x, phi, k) -> (chunk, scan_x, k)
+            phi_mean = chunk.mean(dim=2)
+
+            if mask_realspace is not None:
+                mask_chunk = torch.from_numpy(mask_realspace[y0:y1]).to(self.device)
+                n_chunk = int(mask_chunk.sum())
+                if n_chunk == 0:
+                    continue
+                # mask on the reduced tensor, then sum
+                running_sum += phi_mean[mask_chunk].sum(dim=0)
+                n_valid += n_chunk
+            else:
+                running_sum += phi_mean.sum(dim=(0, 1))
+                n_valid += (y1 - y0) * scan_x
+
+        if n_valid == 0:
+            raise ValueError(
+                "No valid scan positions selected — the real-space mask is "
+                "all-False or the dataset is empty."
+            )
+        self.Ik = (running_sum / n_valid).float()
 
         if returnval:
-            return self.radial_mean
+            return self.Ik
         else:
             return None
 
@@ -646,8 +679,10 @@ class PairDistributionFunction(AutoSerialize):
 
     def calculate_Gr(
         self,
-        k_min: float | None = None,
-        k_max: float | None = None,
+        k_min_fit: float | None = None,
+        k_max_fit: float | None = None,
+        k_min_window: float | None = None,
+        k_max_window: float | None = None,
         k_lowpass: float | None = None,
         k_highpass: float | None = None,
         r_min: float = 0.0,
@@ -655,6 +690,7 @@ class PairDistributionFunction(AutoSerialize):
         r_step: float = 0.02,
         mask_realspace: NDArray | None = None,
         damp_origin_oscillations: bool = False,
+        density: float | None = None,
         r_cut: float = 0.8,
         returnval: bool = False,
     ) -> list[NDArray] | None:
@@ -676,16 +712,22 @@ class PairDistributionFunction(AutoSerialize):
         ``self.rho0`` so that a subsequent :meth:`calculate_gr` call can reuse it.
 
         Stored attributes:
-        * self.radial_mean, self.Ik, self.bg, self.Fk, self.Fk_masked
+        * self.Ik, self.bg, self.Fk, self.Fk_masked
         * self.Sk, self.r, self.reduced_pdf
         * self.rho0, self.Fk_damped, self.reduced_pdf_damped (if damping)
 
         Parameters
         ----------
-        k_min : float, optional
-            Minimum k (A^-1) for masks and transforms.
-        k_max : float or None, optional
-            Maximum k (A^-1) for masks and transforms.
+        k_min_fit : float, optional
+            Minimum k (A^-1) for the background fit.
+        k_max_fit : float or None, optional
+            Maximum k (A^-1) for the background fit.
+        k_min_window : float or None, optional
+            Minimum k (A^-1) for the structure-factor Lorch window.
+            If None, falls back to ``k_min_fit``.
+        k_max_window : float or None, optional
+            Maximum k (A^-1) for the structure-factor Lorch window.
+            If None, falls back to ``k_max_fit``.
         k_lowpass : float or None, optional
             Low-pass Gaussian filter sigma in k-space.
         k_highpass : float or None, optional
@@ -700,6 +742,10 @@ class PairDistributionFunction(AutoSerialize):
             Boolean real-space mask selecting probe positions.
         damp_origin_oscillations : bool, optional
             If True, run :meth:`estimate_density` and store corrected F(k)/G(r).
+        density : float or None, optional
+            Known number density (atoms/A^3). If provided together with
+            ``damp_origin_oscillations=True``, the S(k)/G(r) correction uses
+            this value instead of estimating it.
         r_cut : float, optional
             Minimum radial distance (A) for peak search in density estimation.
             Forwarded to :meth:`estimate_density`.
@@ -710,20 +756,31 @@ class PairDistributionFunction(AutoSerialize):
         -------
         list[np.ndarray] or None
         """
+        # clear results from any previous run so stale state doesn't leak
+        self.Fk_damped = None
+        self.reduced_pdf_damped = None
+        self.rho0 = None
+
         # this is missing a 2pi term that we add back during the pdf calc later
         k_np = np.asarray(self.qq)
         k = self._to_torch(k_np)
         dk = k[1] - k[0]
         # small epsilon to avoid division by very small k values
         k_safe = torch.clamp(k, min=1e-10)
-        self.kmax = k_max if k_max is not None else float(k.max())
-        self.kmin = k_min if k_min is not None else float(k.min())
+        self.kmax_fit = k_max_fit if k_max_fit is not None else float(k.max())
+        self.kmin_fit = k_min_fit if k_min_fit is not None else float(k.min())
+        # window range defaults to bg-fit range when not specified
+        self.kmin_window = k_min_window if k_min_window is not None else self.kmin_fit
+        self.kmax_window = k_max_window if k_max_window is not None else self.kmax_fit
 
         mask_bool = self._get_mask_bool(mask_realspace)
-        # get the radial mean intensity on the entire unmasked region
-        Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
-        # background fitting on Ik
-        bg, f = self.fit_bg(Ik, self.kmin, self.kmax)
+        # reuse existing radial mean if already computed
+        if self.Ik is not None:
+            Ik = self.Ik
+        else:
+            Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
+        # background fitting on Ik (uses the wider fit range)
+        bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit)
         # prevent division by near-zero values which cause NaNs at high k
         f_safe = torch.clamp(f, min=1e-10 * f.max())
 
@@ -738,8 +795,8 @@ class PairDistributionFunction(AutoSerialize):
         self.Sk = torch.where(mask, 1.0 + (Fk / k_safe), self.Sk)
         # apply that missing 2pi factor
         Fk = Fk * 2 * torch.pi
-        # damp edges with lorch window
-        wk = self._lorch_window(k, self.kmin, self.kmax)
+        # damp edges with lorch window (uses the narrower window range)
+        wk = self._lorch_window(k, self.kmin_window, self.kmax_window)
         Fk_win = Fk * wk
 
         r = torch.arange(r_min, r_max, r_step, device=self.device, dtype=torch.float32)
@@ -767,8 +824,9 @@ class PairDistributionFunction(AutoSerialize):
         # optionally damped unphysical oscillations near the origin by iteratively estimating density and correcting F(k)
         if damp_origin_oscillations:
             density_est = self.estimate_density(
+                density=density,
                 r_cut=r_cut,
-                max_iter=20,
+                max_iter=40,
                 tol_percent=1e-1,
             )
             self.rho0 = density_est[0]
@@ -776,9 +834,11 @@ class PairDistributionFunction(AutoSerialize):
             self.reduced_pdf_damped = density_est[2]
 
         if returnval:
-            Gr = getattr(self, "reduced_pdf_damped", None)
-            if Gr is None:
-                Gr = self._reduced_pdf
+            Gr = (
+                self.reduced_pdf_damped
+                if self.reduced_pdf_damped is not None
+                else self._reduced_pdf
+            )
             return [self._to_numpy(self._r), self._to_numpy(Gr)]
         return None
 
@@ -787,6 +847,7 @@ class PairDistributionFunction(AutoSerialize):
         density: float | None = None,
         r_cut: float = 0.8,
         set_pdf_positive: bool = False,
+        zero_low_r: bool = False,
         returnval: bool = False,
     ) -> list[NDArray] | None:
         """
@@ -813,6 +874,10 @@ class PairDistributionFunction(AutoSerialize):
             :meth:`estimate_density`.
         set_pdf_positive : bool, optional
             If True, clamp negative g(r) values to 0.
+        zero_low_r : bool, optional
+            If True, zero g(r) below the first local minimum to the left of the
+            primary peak and linearly ramp from 0 to g(r_thresh) at that point.
+            This enforces the physical constraint that g(r) ≈ 0 at small r.
         returnval : bool, optional
             If True, return ``[r, g(r)]`` as numpy arrays.
 
@@ -831,27 +896,55 @@ class PairDistributionFunction(AutoSerialize):
             rho0 = density
         elif self.rho0 is not None:
             rho0 = self.rho0
+            print(f"  Using estimated rho0 = {rho0:.6f} atoms/A^3", flush=True)
         else:
             # the oscillation correction simultaneously produces a density estimate
             # if the user didn't run damping in calculate_Gr, we can still run the density estimation without using the corrected Fk/G(r)
             density_est = self.estimate_density(
                 r_cut=r_cut,
-                max_iter=20,
+                max_iter=40,
                 tol_percent=1e-1,
             )
             self.rho0 = density_est[0]
             rho0 = self.rho0
+            print(f"  Estimated rho0 = {rho0:.6f} atoms/A^3", flush=True)
 
         # Use damped G(r) if the user opted into damping, otherwise undamped
-        Gr = getattr(self, "reduced_pdf_damped", None)
-        if Gr is None:
-            Gr = self._reduced_pdf
+        Gr = self.reduced_pdf_damped if self.reduced_pdf_damped is not None else self._reduced_pdf
+        Gr = Gr.clone()
 
         r = self._r
+
+        if zero_low_r:
+            # find the primary peak in G(r) and the closest local minimum to
+            # its left, then replace G(r) below that point with -4πρ₀r.
+            # This enforces g(r) = 0 at small r since:
+            #   g(r) = 1 + G(r)/(4πrρ₀) = 1 + (-4πρ₀r)/(4πrρ₀) = 0
+            mask_search = r >= r_cut
+            r_search = r[mask_search]
+            Gr_search = Gr[mask_search]
+            ind_max = torch.argmax(Gr_search)
+            r_peak = float(r_search[ind_max])
+
+            left = (r > 0) & (r < r_peak)
+            if torch.any(left):
+                r_left = r[left]
+                Gr_left = Gr[left]
+                mins_cond = (Gr_left[1:-1] < Gr_left[:-2]) & (Gr_left[1:-1] < Gr_left[2:])
+                mins_indices = torch.where(mins_cond)[0] + 1
+                if mins_indices.numel() > 0:
+                    ind_thresh = mins_indices[-1]
+                else:
+                    ind_thresh = torch.argmin(Gr_left)
+                r_thresh = float(r_left[ind_thresh])
+
+                below = r < r_thresh
+                Gr = torch.where(below, -4 * torch.pi * rho0 * r, Gr)
+
+        # g(r) = 1 + G(r) / (4 * pi * r * rho0)
         mask = r > 0
-        pdf = torch.ones_like(Gr)
-        # the formula for g(r) from G(r) is: g(r) = 1 + G(r) / (4 * pi * r * rho0)
-        pdf = torch.where(mask, 1 + Gr / (4 * torch.pi * r * rho0), torch.zeros_like(pdf))
+        pdf = torch.where(mask, 1 + Gr / (4 * torch.pi * r * rho0), torch.zeros_like(Gr))
+
         if set_pdf_positive:  # negative values are unphysical
             pdf = torch.maximum(pdf, torch.zeros_like(pdf))
 
@@ -862,6 +955,7 @@ class PairDistributionFunction(AutoSerialize):
 
     def estimate_density(
         self,
+        density: float | None = None,
         r_cut: float = 0.8,
         max_iter: int = 40,
         tol_percent: float = 1e-4,
@@ -875,12 +969,20 @@ class PairDistributionFunction(AutoSerialize):
         corrected S(k) so that the implied G(r) is more physically consistent
         at low r.
 
+        If ``density`` is provided, the given value is used as a fixed rho0
+        for the S(k)/G(r) correction instead of estimating it iteratively.
+
         This method requires that :meth:`calculate_Gr` has already been run,
         because it depends on `self.Sk`, `self.reduced_pdf`, `self.r`,
-        and the k-window bounds (`self.kmin`, `self.kmax`).
+        and the k-window bounds (`self.kmin_fit`, `self.kmin_window`,
+        `self.kmax_window`).
 
         Parameters
         ----------
+        density : float or None, optional
+            Known number density (atoms/A^3). If provided, used as a fixed
+            rho0 — the iterative estimation is skipped and only the S(k)/G(r)
+            correction is performed.
         r_cut : float, optional
             Minimum radial distance (A) for the peak search used to determine
             the correction interval. Peaks below this distance are ignored.
@@ -893,7 +995,7 @@ class PairDistributionFunction(AutoSerialize):
         Returns
         -------
         rho0 : float
-            Estimated microscopic number density (atoms/A^3).
+            Number density (atoms/A^3), either provided or estimated.
         Fk_win_damped : torch.Tensor
             Windowed corrected reduced structure function used for the transform.
         G_cor : torch.Tensor
@@ -909,7 +1011,7 @@ class PairDistributionFunction(AutoSerialize):
 
         k = self._to_torch(np.asarray(self.qq))
         dk = k[1] - k[0]
-        k_fit_mask = k >= self.kmin
+        k_fit_mask = (k >= self.kmin_fit) & (k <= self.kmax_window)
         k_fit = k[k_fit_mask]
         ka, ra = torch.meshgrid(k, self._r, indexing="ij")
 
@@ -939,46 +1041,75 @@ class PairDistributionFunction(AutoSerialize):
         # Restrict r to [0, rmin] for the correction
         r_mask = (self._r >= 0.0) & (self._r <= rmin)
         r_short = self._r[r_mask]
-        G_short = self._reduced_pdf[r_mask]
         k_fit_scaled = k_fit * 2 * torch.pi
         k2d_fit, r2d_fit = torch.meshgrid(k_fit_scaled, r_short, indexing="ij")
 
-        # Iterative refinement of rho0 and S(k)
-        rho0 = 0.0
+        # Iterative refinement of rho0 and S(k) using windowed G(r).
+        fixed_density = density is not None
+        rho0 = density if fixed_density else 0.0
         rho0_prev = None
         Sk_cor = self.Sk.clone()
-        G_cor = self._reduced_pdf.clone()
-        Fk_win_damped = self.Fk_masked.clone()
-        # start with uncorrected Gr
-        G_beta = G_short
-        # calculate the lorch window once
-        wk = self._lorch_window(k, self.kmin, self.kmax)
+        # full Lorch window for final output
+        wk = self._lorch_window(k, self.kmin_window, self.kmax_window)
+        # windowed G(r) for the iteration
+        Fk_win = k * (Sk_cor - 1.0) * wk * 2 * torch.pi
+        G_iter = (
+            (2.0 / torch.pi)
+            * dk
+            * 2
+            * torch.pi
+            * torch.sum(torch.sin(2 * torch.pi * ka * ra) * Fk_win[:, None], dim=0)
+        )
+        G_iter[0] = 0.0
+        G_beta = G_iter[r_mask]
+
+        beta_prev = None
         for j in range(max_iter):
             if j > 0:
-                G_beta = G_cor[r_mask]
+                G_beta = G_iter[r_mask]
 
-            # calculate alpha/beta for S(k) adjustment
-            # alpha and beta are the ideal and actual contributions to G(r) in the short-r range
-            # from the current S(k) and G(r)
             alpha, beta = self._compute_alpha_beta(k2d_fit, r2d_fit, G_beta, r_short)
-            rho0 = float(torch.sum(alpha * beta) / torch.sum(alpha**2))
-            if rho0_prev is not None:
-                Rj = np.sqrt(((rho0_prev - rho0) ** 2) / (rho0**2)) * 100.0
-                if Rj < tol_percent:
-                    break
-            # Update S_cor(k) and G_cor
+
+            if not fixed_density:
+                rho0 = float(torch.sum(alpha * beta) / torch.sum(alpha**2))
+                if rho0_prev is not None:
+                    Rj = np.sqrt(((rho0_prev - rho0) ** 2) / (rho0**2)) * 100.0
+                    if Rj < tol_percent:
+                        break
+            else:
+                # fixed density: converge on the S(k) correction magnitude
+                if beta_prev is not None:
+                    delta = float(torch.max(torch.abs(beta - beta_prev)))
+                    if delta < tol_percent * 1e-2:
+                        break
+                beta_prev = beta.clone()
+
+            # Eq. (8): S_cor = S_obs - beta + rho0 * alpha
             Sk_cor[k_fit_mask] = Sk_cor[k_fit_mask] - beta + rho0 * alpha
-            Fk_cor = k * (Sk_cor - 1.0)
-            Fk_win_damped = Fk_cor * wk * 2 * torch.pi
-            G_cor = (
+
+            # recompute windowed G(r) for the next iteration
+            Fk_win = k * (Sk_cor - 1.0) * wk * 2 * torch.pi
+            G_iter = (
                 (2.0 / torch.pi)
                 * dk
                 * 2
                 * torch.pi
-                * torch.sum(torch.sin(2 * torch.pi * ka * ra) * Fk_win_damped[:, None], dim=0)
+                * torch.sum(torch.sin(2 * torch.pi * ka * ra) * Fk_win[:, None], dim=0)
             )
-            G_cor[0] = 0.0
+            G_iter[0] = 0.0
             rho0_prev = rho0
+
+        # final output: windowed G(r)
+        Fk_cor = k * (Sk_cor - 1.0)
+        Fk_win_damped = Fk_cor * wk * 2 * torch.pi
+        G_cor = (
+            (2.0 / torch.pi)
+            * dk
+            * 2
+            * torch.pi
+            * torch.sum(torch.sin(2 * torch.pi * ka * ra) * Fk_win_damped[:, None], dim=0)
+        )
+        G_cor[0] = 0.0
 
         return rho0, Fk_win_damped, G_cor
 
@@ -1067,14 +1198,14 @@ class PairDistributionFunction(AutoSerialize):
         Plotting radial mean intensity vs scattering vector.
         """
 
-        if self.radial_mean is None:
+        if self.Ik is None:
             raise RuntimeError(
                 "Radial mean intensity has not been calculated yet."
                 "Run PairDistributionFunction.calculate_Gr() or PairDistributionFunction.calculate_radial_mean() before plotting."
             )
 
         x = np.asarray(self.qq)
-        y = self._to_numpy(self.radial_mean)
+        y = self._to_numpy(self.Ik)
         x, y = self._apply_xrange(x, y, qmin, qmax)
 
         fig, ax = plt.subplots(figsize=figsize)
@@ -1110,7 +1241,7 @@ class PairDistributionFunction(AutoSerialize):
             )
 
         x = np.asarray(self.qq)
-        y1 = self._to_numpy(self.radial_mean)
+        y1 = self._to_numpy(self.Ik)
         x, y1 = self._apply_xrange(x, y1, qmin, qmax)
         x = np.asarray(self.qq)
         y2 = self._to_numpy(self.bg)
@@ -1186,9 +1317,7 @@ class PairDistributionFunction(AutoSerialize):
                 "Reduced PDF has not been calculated yet."
                 "Run PairDistributionFunction.calculate_Gr() before plotting."
             )
-        Gr = getattr(self, "reduced_pdf_damped", None)
-        if Gr is None:
-            Gr = self._reduced_pdf
+        Gr = self.reduced_pdf_damped if self.reduced_pdf_damped is not None else self._reduced_pdf
 
         x = self._to_numpy(self._r)
         y = self._to_numpy(Gr)
@@ -1279,11 +1408,7 @@ class PairDistributionFunction(AutoSerialize):
         figsize: tuple[float, float] = (8, 4),
         returnfig: bool = False,
     ):
-        if (
-            self.Fk_masked is None
-            or not hasattr(self, "Fk_damped")
-            or not hasattr(self, "reduced_pdf_damped")
-        ):
+        if self.Fk_masked is None or self.Fk_damped is None or self.reduced_pdf_damped is None:
             raise RuntimeError(
                 "Oscillation damping data not available. "
                 "Run calculate_Gr(damp_origin_oscillations=True) first."

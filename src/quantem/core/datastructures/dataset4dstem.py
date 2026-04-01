@@ -13,6 +13,9 @@ from quantem.core.datastructures.polar4dstem import (
 from quantem.core.datastructures.polar4dstem import (
     dataset4dstem_polar_transform as _dataset4dstem_polar_transform,
 )
+from quantem.core.datastructures.polar4dstem import (
+    fit_elliptical_distortion as _fit_elliptical_distortion,
+)
 from quantem.core.utils.validators import ensure_valid_array
 from quantem.core.visualization import show_2d
 from quantem.core.visualization.visualization_utils import ScalebarConfig
@@ -767,3 +770,11 @@ class Dataset4dstem(Dataset4d):
         return _auto_origin_id(self, **kwargs)
 
     polar_transform = _dataset4dstem_polar_transform
+
+    def fit_elliptical_distortion(self, **kwargs):
+        """Fit elliptical distortion from the mean diffraction pattern.
+
+        Delegates to the module-level ``fit_elliptical_distortion`` function.
+        See its docstring for full parameter details.
+        """
+        return _fit_elliptical_distortion(self, **kwargs)

@@ -16,6 +16,7 @@ from quantem.core.datastructures.polar4dstem import (
     Polar4dstem,
     auto_origin_id,
     dataset4dstem_polar_transform,
+    fit_elliptical_distortion,
 )
 from quantem.core.io.serialize import AutoSerialize
 from quantem.core.utils.validators import ensure_valid_array
@@ -85,7 +86,8 @@ class PairDistributionFunction(AutoSerialize):
         find_origin: bool = True,
         origin_row: float | None = None,
         origin_col: float | None = None,
-        ellipse_params: tuple[float, float, float] | None = None,
+        ellipse_params: tuple[float, float, float] | Literal["auto"] | None = None,
+        ellipse_fit_radii: tuple[float, float] | None = None,
         num_annular_bins: int = 180,
         radial_min: float = 0.0,
         radial_max: float | None = None,
@@ -116,6 +118,13 @@ class PairDistributionFunction(AutoSerialize):
         origin_row, origin_col
             Diffraction-space origin (in pixels), used only if `find_origin=False`. If None,
             defaults to the central pixel of the diffraction pattern.
+        ellipse_params
+            Ellipse parameters (a, b, theta_deg) for distortion correction.
+            If ``"auto"``, fits the elliptical distortion from the mean DP
+            using :func:`fit_elliptical_distortion`. Requires ``ellipse_fit_radii``.
+        ellipse_fit_radii
+            Inner and outer radii of the annular fitting region, required
+            when ``ellipse_params="auto"``.
         Other parameters
             Passed through to Dataset4dstem.polar_transform when needed.
         """
@@ -152,6 +161,27 @@ class PairDistributionFunction(AutoSerialize):
         # Dataset4dstem input: polar-transform it
         if isinstance(data, Dataset4dstem):
             scan_y, scan_x, ny, nx = data.array.shape
+
+            # Auto-fit elliptical distortion from the mean DP
+            if ellipse_params == "auto":
+                if ellipse_fit_radii is None:
+                    raise ValueError(
+                        "ellipse_fit_radii=(r_inner, r_outer) is required "
+                        "when ellipse_params='auto'."
+                    )
+                # Use a preliminary center for the fit
+                if origin_row is not None and origin_col is not None:
+                    fit_center = (origin_row, origin_col)
+                else:
+                    fit_center = ((ny - 1) / 2.0, (nx - 1) / 2.0)
+                fit_result = fit_elliptical_distortion(
+                    data,
+                    center=fit_center,
+                    fit_radii=ellipse_fit_radii,
+                    device=device,
+                )
+                ellipse_params = fit_result["ellipse_params"]
+
             if find_origin:
                 origin_array = auto_origin_id(
                     data,
@@ -203,6 +233,7 @@ class PairDistributionFunction(AutoSerialize):
                 origin_row=origin_row,
                 origin_col=origin_col,
                 ellipse_params=ellipse_params,
+                ellipse_fit_radii=ellipse_fit_radii,
                 num_annular_bins=num_annular_bins,
                 radial_min=radial_min,
                 radial_max=radial_max,
@@ -218,6 +249,7 @@ class PairDistributionFunction(AutoSerialize):
                 origin_row=origin_row,
                 origin_col=origin_col,
                 ellipse_params=ellipse_params,
+                ellipse_fit_radii=ellipse_fit_radii,
                 num_annular_bins=num_annular_bins,
                 radial_min=radial_min,
                 radial_max=radial_max,

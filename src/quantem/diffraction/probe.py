@@ -414,6 +414,124 @@ def deconvolve_probe(
     return deconvolved
 
 
+def deconvolve_probe_1d(
+    radial_intensity: NDArray,
+    probe_radial: NDArray,
+    gamma: float | None = None,
+) -> NDArray:
+    """
+    1D Wiener-filter deconvolution of an azimuthally averaged intensity profile.
+
+    This follows the procedure of Hirotsu *et al.*, J. Electron Microsc.
+    **50**, 435 (2001) directly: the deconvolution is performed on the
+    1D radial profile *after* azimuthal averaging, which benefits from
+    the noise reduction of the averaging step.
+
+    The observed radial intensity is modelled as:
+
+        I_obs(Q) = |q(Q)|^2 * F(Q)
+
+    where F(Q) is the radial intensity profile of the probe (the beam
+    intensity distribution).  The Wiener filter recovers |q(Q)|^2::
+
+        I(r) = I_obs(r) · F*(r) / (|F(r)|^2 + γ)
+
+    where r is the Fourier-conjugate variable and γ is the regularisation
+    parameter.
+
+    Parameters
+    ----------
+    radial_intensity
+        1D azimuthally averaged diffraction intensity profile I_obs(Q).
+    probe_radial
+        1D azimuthally averaged probe intensity profile F(Q).  Must be
+        the same length as *radial_intensity*.
+    gamma
+        Wiener regularisation parameter.  If ``None``, defaults to
+        ``0.08 * max(|F(r)|^2)``, following Hirotsu *et al.*
+
+    Returns
+    -------
+    NDArray
+        Deconvolved 1D radial intensity profile.
+    """
+    radial_intensity = np.asarray(radial_intensity, dtype=np.float64)
+    probe_radial = np.asarray(probe_radial, dtype=np.float64)
+
+    if radial_intensity.ndim != 1 or probe_radial.ndim != 1:
+        raise ValueError("Both radial_intensity and probe_radial must be 1D arrays.")
+
+    if radial_intensity.shape != probe_radial.shape:
+        raise ValueError(
+            f"Shape mismatch: radial_intensity {radial_intensity.shape} "
+            f"vs probe_radial {probe_radial.shape}."
+        )
+
+    n = len(radial_intensity)
+
+    # Normalise probe to unit sum
+    psf_sum = probe_radial.sum()
+    if psf_sum > 0:
+        probe_radial = probe_radial / psf_sum
+
+    # Zero-pad to length 2N to compute linear (not circular) deconvolution
+    # via FFT.  The paper's eq. (4) is a continuous Fourier transform which
+    # implicitly assumes linear convolution; without padding the FFT wraps
+    # high-k artifacts back into low-k and vice versa.
+    pad_len = 2 * n
+    F_obs = np.fft.fft(radial_intensity, n=pad_len)
+    F_psf = np.fft.fft(probe_radial, n=pad_len)
+
+    F_psf_sq = np.abs(F_psf) ** 2
+    if gamma is None:
+        gamma = 0.08 * np.max(F_psf_sq)
+
+    F_deconv = F_obs * np.conj(F_psf) / (F_psf_sq + gamma)
+    deconvolved = np.real(np.fft.ifft(F_deconv))
+
+    return deconvolved[:n]
+
+
+def radial_profile(
+    dp: NDArray,
+    center_row: float | None = None,
+    center_col: float | None = None,
+) -> NDArray:
+    """
+    Compute the azimuthal average (radial profile) of a 2D pattern.
+
+    Parameters
+    ----------
+    dp
+        2D diffraction pattern.
+    center_row, center_col
+        Center coordinates.  If ``None``, estimated via :func:`get_probe_size`.
+
+    Returns
+    -------
+    NDArray
+        1D radial profile, length ``min(center_row, center_col,
+        ny - center_row, nx - center_col)``.
+    """
+    dp = np.asarray(dp, dtype=np.float64)
+    if center_row is None or center_col is None:
+        _, cr_est, cc_est = get_probe_size(dp)
+        center_row = center_row if center_row is not None else cr_est
+        center_col = center_col if center_col is not None else cc_est
+
+    ny, nx = dp.shape
+    rows, cols = np.indices(dp.shape)
+    r = np.sqrt((rows - center_row) ** 2 + (cols - center_col) ** 2)
+    r_int = r.astype(int)
+    max_r = int(min(center_row, center_col, ny - center_row, nx - center_col))
+
+    radial = np.bincount(r_int.ravel(), weights=dp.ravel(), minlength=max_r)
+    counts = np.bincount(r_int.ravel(), minlength=max_r)
+    counts[counts == 0] = 1
+
+    return radial[:max_r] / counts[:max_r]
+
+
 def plot_probe_estimate(
     dp: NDArray,
     radius: float | None = None,

@@ -1,6 +1,7 @@
 from quantem.diffraction.calibration import ReciprocalCalibration as ReciprocalCalibration
 from quantem.diffraction.polar import PairDistributionFunction as PairDistributionFunction
 from quantem.diffraction.probe import deconvolve_probe as deconvolve_probe
+from quantem.diffraction.probe import deconvolve_probe_1d as deconvolve_probe_1d
 from quantem.diffraction.probe import get_probe_kernel as get_probe_kernel
 from quantem.diffraction.probe import get_probe_size as get_probe_size
 from quantem.diffraction.probe import get_vacuum_probe as get_vacuum_probe

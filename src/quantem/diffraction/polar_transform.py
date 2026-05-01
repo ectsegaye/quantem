@@ -470,6 +470,7 @@ def polar_transform(
     signal_units: str | None = None,
     scan_pos: tuple[int, int] | None = None,
     device: str = "cpu",
+    batch_size: int = 128,
 ) -> Polar4dstem | torch.Tensor:
     if data.array.ndim != 4:
         raise ValueError(
@@ -535,50 +536,57 @@ def polar_transform(
         radial_max_eff_array = np.minimum.reduce([r_row_pos, r_row_neg, r_col_pos, r_col_neg])
         radial_max = float(max(radial_max_eff_array.min(), radial_min + radial_step))
 
-    # Compute grid for first position to get output shape
-    grid, phi_bins, radial_bins, radial_max_eff = _precompute_polar_coords(
-        n_row=n_row,
-        n_col=n_col,
-        origin_row=float(origins[0, 0, 0]),
-        origin_col=float(origins[0, 0, 1]),
-        ellipse_params=ellipse_params,
-        num_annular_bins=num_annular_bins,
-        radial_min=radial_min,
-        radial_max=radial_max,
-        radial_step=radial_step,
-        two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-        device=device,
+    # Build origin-independent polar offsets ONCE. Only the per-origin shift
+    # changes from one scan position to the next, so we can reuse these.
+    offset_row, offset_col, phi_bins, radial_bins = _build_polar_sampling_offsets(
+        ellipse_params,
+        num_annular_bins,
+        radial_min,
+        float(radial_max),
+        radial_step,
+        two_fold_rotation_symmetry,
+        device,
     )
     n_phi = phi_bins.numel()
     n_r = radial_bins.numel()
-    out = np.empty((scan_row, scan_col, n_phi, n_r), dtype=np.float32)
-    for i_row in range(scan_row):
-        for i_col in range(scan_col):
-            dp = torch.from_numpy(data.array[i_row, i_col].astype(np.float32)).to(device)
-            r0 = float(origins[i_row, i_col, 0])
-            c0 = float(origins[i_row, i_col, 1])
-            grid, _, _, _ = _precompute_polar_coords(
-                n_row=n_row,
-                n_col=n_col,
-                origin_row=r0,
-                origin_col=c0,
-                ellipse_params=ellipse_params,
-                num_annular_bins=num_annular_bins,
-                radial_min=radial_min,
-                radial_max=radial_max,
-                radial_step=radial_step,
-                two_fold_rotation_symmetry=two_fold_rotation_symmetry,
-                device=device,
-            )
-            dp_batch = dp[None, None]
-            polar2d = F.grid_sample(
-                dp_batch,
-                grid,
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=True,
-            )
-            out[i_row, i_col] = to_numpy(polar2d.squeeze(0).squeeze(0))
+    radial_max_eff = float(radial_max)
+
+    # Pre-normalize offsets into grid_sample's [-1, 1] coordinate convention
+    col_norm_scale = 2.0 / (n_col - 1)
+    row_norm_scale = 2.0 / (n_row - 1)
+    base_col_norm = offset_col * col_norm_scale  # (n_phi, n_r)
+    base_row_norm = offset_row * row_norm_scale  # (n_phi, n_r)
+
+    # Flatten scan dims so we can iterate in flat batches
+    n_pos = scan_row * scan_col
+    dp_view = data.array.reshape(n_pos, n_row, n_col)
+    origins_t = torch.from_numpy(
+        np.ascontiguousarray(origins.reshape(n_pos, 2), dtype=np.float32)
+    ).to(device)
+
+    out = np.empty((n_pos, n_phi, n_r), dtype=np.float32)
+    for start in tqdm(range(0, n_pos, batch_size), desc="Polar transform"):
+        end = min(start + batch_size, n_pos)
+        # Translate the precomputed offsets to each origin in this batch
+        row_origins = origins_t[start:end, 0]
+        col_origins = origins_t[start:end, 1]
+        grid_col = base_col_norm.unsqueeze(0) + (col_origins * col_norm_scale - 1.0)[:, None, None]
+        grid_row = base_row_norm.unsqueeze(0) + (row_origins * row_norm_scale - 1.0)[:, None, None]
+        # grid_sample requires (col, row) ordering in the last dim
+        grids = torch.stack([grid_col, grid_row], dim=-1)
+
+        dp_batch = torch.from_numpy(np.ascontiguousarray(dp_view[start:end], dtype=np.float32)).to(
+            device
+        )
+        polars = F.grid_sample(
+            dp_batch.unsqueeze(1),
+            grids,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=True,
+        )
+        out[start:end] = to_numpy(polars.squeeze(1))
+    out = out.reshape(scan_row, scan_col, n_phi, n_r)
 
     # Get polar axes in physical units matching the input dataset's calibration
     phi_range = np.pi if two_fold_rotation_symmetry else 2.0 * np.pi

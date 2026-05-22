@@ -24,7 +24,7 @@ def auto_origin_id(
     two_fold_rotation_symmetry: bool = False,
     device: str = "cpu",
     batch_size: int = 16,
-    local_margin: int = 25,
+    local_margin: int = 40,
 ) -> NDArray:
     """
     Automatic diffraction center finding by minimizing angular intensity
@@ -82,20 +82,26 @@ def auto_origin_id(
             "To use auto_origin_id, pass a 2D or 4DSTEM dataset."
         )
 
-    origin_array = np.zeros((scan_row, scan_col, 2), dtype=float)
-    # first get COM of mean DP because it gives a robust rough center
-    array_4d = data.array if data.array.ndim == 4 else data.array[None, None, :, :]
-    mean_dp_np = array_4d.mean(axis=(0, 1)).astype(np.float32)
-    total_intensity = mean_dp_np.sum()
-    row_grid, col_grid = np.mgrid[0:n_row, 0:n_col]
-    com_row = int(round(float((row_grid * mean_dp_np).sum() / total_intensity)))
-    com_col = int(round(float((col_grid * mean_dp_np).sum() / total_intensity)))
+    # Move the full dataset to the chosen device once. All subsequent
+    # work (mean DP, COM, mean-DP search, per-DP refinement) runs on
+    # this single tensor so the inner loop does no CPU<->GPU traffic.
+    array_t = torch.as_tensor(data.array).to(device=device, dtype=torch.float32)
+    if array_t.ndim == 2:
+        array_t = array_t[None, None]
+
+    # COM of mean DP (rough center) -- all on device
+    mean_dp_t = array_t.mean(dim=(0, 1))
+    total_intensity = mean_dp_t.sum()
+    row_grid_t = torch.arange(n_row, dtype=torch.float32, device=device)[:, None]
+    col_grid_t = torch.arange(n_col, dtype=torch.float32, device=device)[None, :]
+    com_row = int(round(float(((row_grid_t * mean_dp_t).sum() / total_intensity).item())))
+    com_col = int(round(float(((col_grid_t * mean_dp_t).sum() / total_intensity).item())))
     # Radial max of the search polar grid, so dp_mean search candidates
     # (at ±global_margin from COM) stay within image bounds
     # in-image. Single pos candidates further from COM might be out of bounds
     # and are masked with [safe_low, safe_high_*] if so
     # (zero-padded samples would otherwise produce a falsely low score)
-    global_margin = 20
+    global_margin = 40
     safe_radial_max = float(
         min(
             com_row - global_margin,
@@ -124,7 +130,7 @@ def auto_origin_id(
         device,
     )
     n_r = radial_bins.numel()
-    min_r_idx = int(np.floor(0.1 * n_r))
+    min_r_idx = 0
     max_r_idx = int(np.ceil(0.9 * n_r))
     # Normalize offsets to [-1, 1] because grid_sample expects normalized coordinates
     col_norm_scale = 2.0 / (n_col - 1)
@@ -134,7 +140,7 @@ def auto_origin_id(
 
     # Mean-DP global center search: coarse → fine, masking candidates
     # whose polar grid would extend OOB at each step.
-    mean_dp_batch = torch.from_numpy(mean_dp_np).to(device)[None, None]
+    mean_dp_batch = mean_dp_t[None, None]
     # Coarse: step=4 over ±global_margin around the COM
     rows, cols, grids = _build_candidate_grids(
         base_col_norm,
@@ -147,7 +153,7 @@ def auto_origin_id(
         col_norm_scale,
         row_norm_scale,
         device,
-        step=4,
+        step=2,
     )
     scores = _angular_std_scores(mean_dp_batch, grids, min_r_idx, max_r_idx)
     valid = (
@@ -161,7 +167,7 @@ def auto_origin_id(
         base_row_norm,
         coarse_row,
         coarse_col,
-        6,
+        10,
         n_row,
         n_col,
         col_norm_scale,
@@ -200,16 +206,16 @@ def auto_origin_id(
     n_coarse = coarse_grids.shape[0]
     # Per-DP relative offsets used by the medium and fine stages
     med_rel = torch.arange(
-        -local_coarse_step, local_coarse_step + 1, 2, dtype=torch.long, device=device
+        -local_coarse_step, local_coarse_step + 1, 1, dtype=torch.long, device=device
     )
     med_drow, med_dcol = (m.reshape(-1) for m in torch.meshgrid(med_rel, med_rel, indexing="ij"))
-    fine_rel = torch.arange(-1, 2, dtype=torch.long, device=device)
+    fine_rel = torch.arange(-2, 3, dtype=torch.long, device=device)
     fine_drow, fine_dcol = (
         m.reshape(-1) for m in torch.meshgrid(fine_rel, fine_rel, indexing="ij")
     )
-    flat_dps = array_4d.reshape(-1, n_row, n_col)
-    origin_flat = origin_array.reshape(-1, 2)
-    n_pos = flat_dps.shape[0]
+    flat_dps_t = array_t.reshape(-1, n_row, n_col)
+    n_pos = flat_dps_t.shape[0]
+    origin_flat_t = torch.zeros(n_pos, 2, dtype=torch.float32, device=device)
 
     def refine(dp_batch, current_row, current_col, drow, dcol):
         """scores candidates per DP and return the best(row, col) per DP. Invalid (out of bounds) candidates are masked."""
@@ -227,11 +233,10 @@ def auto_origin_id(
         polars = F.grid_sample(
             dps, grids, mode="bilinear", padding_mode="zeros", align_corners=True
         )
-        scores = (
-            polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[..., min_r_idx:max_r_idx]
-            .std(dim=2)
-            .sum(dim=2)
-        )
+        region = polars.view(dp_batch.shape[0], n_cands, *base_col_norm.shape)[
+            ..., min_r_idx:max_r_idx
+        ]
+        scores = region.std(dim=2).sum(dim=2) / (region.mean(dim=2).sum(dim=2) + 1e-6)
         valid = (
             (cand_rows >= safe_low)
             & (cand_rows <= safe_high_row)
@@ -248,11 +253,7 @@ def auto_origin_id(
     for start in range(0, n_pos, batch_size):
         end = min(start + batch_size, n_pos)
         bsz = end - start
-        dp_b = (
-            torch.from_numpy(np.ascontiguousarray(flat_dps[start:end], dtype=np.float32))
-            .to(device)
-            .unsqueeze(1)
-        )  # (B, 1, H, W)
+        dp_b = flat_dps_t[start:end].unsqueeze(1)  # (B, 1, H, W), already on device
         # Coarse (shared grids): broadcast B DPs across n_coarse candidate
         # grids in one grid_sample call by stacking DPs in the channel dim
         # and stride-0 expanding along the candidate dim
@@ -263,7 +264,10 @@ def auto_origin_id(
             padding_mode="zeros",
             align_corners=True,
         )
-        scores_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx].std(dim=2).sum(dim=2)
+        region_coarse = polars_coarse[:, :, :, min_r_idx:max_r_idx]
+        scores_coarse = region_coarse.std(dim=2).sum(dim=2) / (
+            region_coarse.mean(dim=2).sum(dim=2) + 1e-6
+        )
         scores_coarse = scores_coarse.masked_fill(~coarse_valid[:, None], float("inf"))
         best_coarse = scores_coarse.argmin(dim=0)  # best candidate per DP
         current_row, current_col = coarse_rows[best_coarse], coarse_cols[best_coarse]
@@ -271,11 +275,11 @@ def auto_origin_id(
         current_row, current_col = refine(dp_b, current_row, current_col, med_drow, med_dcol)
         # Fine: per-DP ±1 around the medium winner
         current_row, current_col = refine(dp_b, current_row, current_col, fine_drow, fine_dcol)
-        origin_flat[start:end, 0] = current_row.cpu().numpy()
-        origin_flat[start:end, 1] = current_col.cpu().numpy()
+        origin_flat_t[start:end, 0] = current_row.to(torch.float32)
+        origin_flat_t[start:end, 1] = current_col.to(torch.float32)
         pbar.update(bsz)
     pbar.close()
-    return origin_array
+    return origin_flat_t.cpu().numpy().reshape(scan_row, scan_col, 2)
 
 
 def polar_transform(
@@ -617,6 +621,9 @@ def _angular_std_scores(
         align_corners=True,
     )
     # A correctly centered pattern has uniform intensity along each ring,
-    # so the angular std is minimized at the true center
+    # so the angular std is minimized at the true center. Normalize by
+    # mean intensity so candidates whose polar grid samples only background
+    # do not win on absolute std alone (relevant when search windows are
+    # wide enough to include centers far from the direct beam).
     region = polars.squeeze(1)[:, :, min_r_idx:max_r_idx]
-    return region.std(dim=1).sum(dim=1)
+    return region.std(dim=1).sum(dim=1) / (region.mean(dim=1).sum(dim=1) + 1e-6)

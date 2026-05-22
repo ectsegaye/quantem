@@ -6,7 +6,6 @@ from typing import Literal, Self
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn.functional as F
 from numpy.typing import NDArray
 
 from quantem.core.datastructures.dataset2d import Dataset2d
@@ -157,6 +156,7 @@ class PairDistributionFunction(AutoSerialize):
         find_origin: bool = True,
         origin_row: float | None = None,
         origin_col: float | None = None,
+        origin_array: NDArray | None = None,
         ellipse_params: tuple[float, float, float] | None = None,
         num_annular_bins: int = 180,
         radial_min: float = 0.0,
@@ -181,8 +181,13 @@ class PairDistributionFunction(AutoSerialize):
             image center if those are None).
         origin_row, origin_col : float or None
             Fixed diffraction-space origin in pixels, used only when
-            ``find_origin=False``. Defaults to the center of the diffraction
-            pattern.
+            ``find_origin=False`` and ``origin_array`` is None. Defaults to
+            the center of the diffraction pattern.
+        origin_array : ndarray or None
+            Pre-computed per-DP origins of shape ``(scan_row, scan_col, 2)``.
+            When provided, ``auto_origin_id`` is skipped and these origins
+            are used directly. Takes precedence over ``find_origin`` and
+            ``origin_row``/``origin_col``.
         ellipse_params : tuple of (float, float, float) or None
             Elliptical distortion parameters ``(a, b, theta_deg)`` applied
             during origin finding and polar transform.
@@ -229,7 +234,14 @@ class PairDistributionFunction(AutoSerialize):
         # Dataset4dstem input: polar-transform it
         if isinstance(data, Dataset4dstem):
             scan_row, scan_col, n_row, n_col = data.array.shape
-            if find_origin:
+            if origin_array is not None:
+                origin_array = np.asarray(origin_array, dtype=float)
+                if origin_array.shape != (scan_row, scan_col, 2):
+                    raise ValueError(
+                        f"origin_array has shape {origin_array.shape}, expected "
+                        f"({scan_row}, {scan_col}, 2)."
+                    )
+            elif find_origin:
                 origin_array = auto_origin_id(
                     data,
                     ellipse_params=ellipse_params,
@@ -386,22 +398,124 @@ class PairDistributionFunction(AutoSerialize):
         Ik: torch.Tensor,
         kmin: float | None = None,
         kmax: float | None = None,
+        method: str = "scipy",
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fit a smooth background B(k) to a radial intensity curve I(k).
+
+        Thin dispatcher over two fitting backends:
+
+        * ``method="scipy"`` (default) -- :meth:`_fit_bg_scipy`, a
+          ``scipy.optimize.curve_fit`` of the parametric model. Robust;
+          the current production path.
+        * ``method="torch"`` -- :meth:`_fit_bg_torch`, the torch-native
+          Levenberg-Marquardt fit. Kept available but known to
+          underperform scipy on real experimental data.
+
+        Both share the same model, return ``(bg, f)`` and set
+        ``self.bg`` / ``self.f``. See the two methods for details.
+        """
+        if method == "scipy":
+            return self._fit_bg_scipy(Ik, kmin, kmax)
+        elif method == "torch":
+            return self._fit_bg_torch(Ik, kmin, kmax)
+        raise ValueError(
+            f"fit_bg: unknown method {method!r}; use 'scipy' or 'torch'."
+        )
+
+    def _fit_bg_scipy(
+        self,
+        Ik: torch.Tensor,
+        kmin: float | None = None,
+        kmax: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Fit the background with ``scipy.optimize.curve_fit``.
+
+        Same model as :meth:`_fit_bg_torch`:
+
+            B(k) = c
+                 + i0 * exp(-k^2 / (2 s0^2))
+                 + i1 * exp(-k^4 / (2 s1^4))
+
+        Fit in linear space with ``sigma=I(k)`` (relative weighting, so the
+        bright central beam does not dominate) and non-negative bounds.
+        B(k) is evaluated over the full k axis; f(k) = B(k) - c.
+        """
+        from scipy.optimize import curve_fit
+
+        k = np.asarray(self.qq, dtype=np.float64)
+        Ik_np = to_numpy(Ik).astype(np.float64)
+        if kmin is None:
+            kmin = float(k.min())
+        if kmax is None:
+            kmax = float(k.max())
+
+        def _model(kk, c, i0, s0, i1, s1):
+            return (
+                c
+                + i0 * np.exp(-(kk**2) / (2 * s0**2))
+                + i1 * np.exp(-(kk**4) / (2 * s1**4))
+            )
+
+        m = (k >= kmin) & (k <= kmax)
+        q_fit = k[m]
+        I_fit = np.clip(Ik_np[m], 1e-10, None)
+
+        c0 = float(I_fit.min())
+        p0 = [
+            max(c0, 1e-10),
+            max(float(I_fit.max()) - c0, 1e-10),
+            0.05,
+            max(float(np.median(I_fit)) - c0, 1e-10),
+            max(float(q_fit.mean()), 1e-3),
+        ]
+        popt, _ = curve_fit(
+            _model,
+            q_fit,
+            I_fit,
+            p0=p0,
+            sigma=I_fit,
+            absolute_sigma=False,
+            bounds=(0, np.inf),
+            maxfev=20000,
+        )
+
+        c = popt[0]
+        bg_np = _model(k, *popt)
+        f_np = np.clip(bg_np - c, 1e-10 * float(bg_np.max()), None)
+        bg = torch.from_numpy(bg_np.astype(np.float32)).to(self.device)
+        f = torch.from_numpy(f_np.astype(np.float32)).to(self.device)
+        self.bg = bg
+        self.f = f
+        return bg, f
+
+    def _fit_bg_torch(
+        self,
+        Ik: torch.Tensor,
+        kmin: float | None = None,
+        kmax: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Fit a smooth background B(k) to a radial intensity curve I(k) using
-        PyTorch LBFGS optimizer, with weighting that downweights the low-k
-        region and emphasizes higher k. LBFGS was chosen empirically through
-        trial and error to see which optimizer matched scipy.curve_fit() best
-        on test data.
+        Fit a smooth background B(k) to a radial intensity curve I(k).
+
+        The background model is a constant plus two monotonically decaying
+        terms (adopted from py4DSTEM):
+
+            B(k) = c
+                 + i0 * exp(-k^2 / (2 s0^2))
+                 + i1 * exp(-k^4 / (2 s1^4))
 
         B(k) is later subtracted from I(k) to isolate the diffuse signal, and
-        f(k) is used as the denominator in the structure factor
+        f(k) = B(k) - c is used as the denominator in the structure factor
         S(k) = 1 + [I(k) − B(k)] / f(k).
 
-        The fitted function uses the following form (adopted from py4dstem):
-            B(k) = c
-                + i0 * exp(-k^2 / (2 s0^2))
-                + i1 * exp(-k^4 / (2 s1^4))
+        The five parameters are fit by a torch-native Levenberg-Marquardt
+        routine. The loss is the sum of squared *log-space* residuals,
+        ``[log B(k) − log I(k)]^2``. Because I(k) = B(k) * S(k), the
+        log-space residual is ``log S(k)`` — the fractional structure
+        modulation — which is the physically natural, scale-free quantity
+        to minimize when placing a smooth envelope through oscillating
+        data. Parameters are optimized in log space so they stay positive
+        (keeping B(k) monotonic) and the Jacobian stays well scaled.
 
         Parameters
         ----------
@@ -409,9 +523,9 @@ class PairDistributionFunction(AutoSerialize):
             1D radial intensity tensor (Nk,). Produced by
             :meth:`calculate_radial_mean`.
         kmin, kmax
-            k-range (in the same units as the internally constructed `k` grid)
-            used to build the low-k weighting mask. If None, defaults to the
-            min/max of the k axis.
+            Restrict the fit to k in [kmin, kmax]. The returned B(k) is
+            still evaluated over the full k axis. If None, the full k
+            range is used.
 
         Returns
         -------
@@ -428,80 +542,91 @@ class PairDistributionFunction(AutoSerialize):
             kmax = float(k.max())
         k2 = k**2
 
-        # normalize intensity
-        int_mean = Ik.mean()
-        Ik_norm = Ik / int_mean
-        # initial guesses
-        const_bg = float(Ik_norm.min())
-        int0 = float(Ik_norm.median()) - const_bg
-        sigma0 = float(k.mean())
-        # ensure positive values
-        const_bg = max(const_bg, 1e-6)
-        int0 = max(int0, 1e-6)
-        sigma0 = max(sigma0, 1e-6)
+        # Restrict the fit to [kmin, kmax]; B(k) is evaluated over all k afterwards.
+        fit_mask = (k >= kmin) & (k <= kmax)
+        k2_fit = k2[fit_mask]
+        # Clamp to a positive floor so log() is safe on noisy / zero bins.
+        Ik_fit = Ik[fit_mask].clamp(min=1e-10)
+        logIk_fit = torch.log(Ik_fit)
 
+        # Initial guesses: narrow Gaussian for the central beam (s0), broad
+        # super-Gaussian envelope (s1); amplitudes from the intensity range.
+        c_init = float(Ik_fit.min())
+        i0_init = float(Ik_fit.max()) - c_init
+        i1_init = float(Ik_fit.median()) - c_init
         init_vals = torch.tensor(
-            [const_bg, int0, sigma0, int0, sigma0],
-            device=self.device,
+            [
+                max(c_init, 1e-6),
+                max(i0_init, 1e-6),
+                0.05,
+                max(i1_init, 1e-6),
+                max(float(k.mean()), 1e-6),
+            ],
             dtype=torch.float32,
+            device=self.device,
         )
-        # Map to unconstrained space via inverse softplus: x = y + log(1 - exp(-y))
-        # For numerical stability, clamp init_vals away from zero
-        # final values must be positive for a physical model of background scattering
-        init_vals = torch.clamp(init_vals, min=1e-6)
-        theta = init_vals + torch.log(-torch.expm1(-init_vals))
-        theta = theta.clone().detach().requires_grad_(True)
-        optimizer = torch.optim.LBFGS(
-            [theta],
-            lr=1.0,
-            max_iter=20,
-            tolerance_grad=1e-7,
-            tolerance_change=1e-9,
-            line_search_fn="strong_wolfe",
-        )
+        # Optimize log(params): guarantees positivity (B(k) stays monotonic)
+        # and keeps the Jacobian well scaled across the wide parameter range.
+        theta = torch.log(init_vals)
 
-        # fitting weights (high-k range is emphasized for better bg estimation)
-        # this monotonic model means we don't need parameterized scattering factors
-        weights = self._compute_fit_weights(k, kmin, kmax)
+        def _residuals(th: torch.Tensor) -> torch.Tensor:
+            """Log-space residual vector r(theta) = log B(k) - log I(k)."""
+            c, i0, s0, i1, s1 = torch.exp(th).unbind()
+            B = self._scattering_model_torch(k2_fit, c, i0, s0, i1, s1)
+            return torch.log(B.clamp(min=1e-10)) - logIk_fit
 
-        def closure() -> torch.Tensor:
-            """LBFGS loss callback: weighted squared residual in softplus-constrained space."""
-            optimizer.zero_grad()
-            # Map from unconstrained to constrained (positive) space via softplus
-            c = F.softplus(theta[0])
-            i0 = F.softplus(theta[1])
-            s0 = F.softplus(theta[2])
-            i1 = F.softplus(theta[3])
-            s1 = F.softplus(theta[4])
-            pred = self._scattering_model_torch(k2, c, i0, s0, i1, s1)
-            residuals = (pred - Ik_norm) ** 2
-            loss = (residuals / (weights**2)).sum()
-            loss.backward()
-            return loss
+        def _loss(th: torch.Tensor) -> torch.Tensor:
+            r = _residuals(th)
+            return torch.dot(r, r)
 
-        prev_loss = torch.tensor(float("inf"))
-        max_outer_iter = 100
-        tol = 1e-8
-        for step in range(max_outer_iter):
-            loss = optimizer.step(closure)
-            if torch.abs(prev_loss - loss) < tol:
+        # ---- torch-native Levenberg-Marquardt --------------------------------
+        # Each step solves (JtJ + lam * diag(JtJ)) d = Jt r, with lam adapting
+        # between Gauss-Newton (small lam, fast near the optimum) and damped
+        # gradient descent (large lam, safe far away / on ill-conditioned J).
+        # The step is also capped in log-parameter space (a trust region):
+        # the model is near-degenerate -- the two decaying terms can swap
+        # roles -- so an unrestrained Gauss-Newton step can jump into a worse
+        # basin. The cap keeps each parameter within a factor of ~e per step.
+        lam = 1.0
+        max_log_step = 1.0
+        loss = _loss(theta)
+        for _ in range(200):
+            jac = torch.autograd.functional.jacobian(_residuals, theta)  # (N, 5)
+            res = _residuals(theta)  # (N,)
+            JtJ = jac.T @ jac  # (5, 5)
+            Jtr = jac.T @ res  # (5,)
+            diag = torch.diagonal(JtJ).clamp(min=1e-12)
+            accepted = False
+            for _ in range(30):
+                A = JtJ + lam * torch.diag(diag)
+                try:
+                    delta = torch.linalg.solve(A, Jtr)
+                except RuntimeError:
+                    lam = min(lam * 3.0, 1e12)
+                    continue
+                # trust region: cap the step length in log-parameter space
+                step_scale = max_log_step / delta.abs().max().clamp(min=1e-30)
+                if step_scale < 1.0:
+                    delta = delta * step_scale
+                theta_trial = theta - delta
+                loss_trial = _loss(theta_trial)
+                if torch.isfinite(loss_trial) and loss_trial < loss:
+                    accepted = True
+                    break
+                lam = min(lam * 3.0, 1e12)
+            if not accepted:
+                break  # no downhill step found -> converged or stuck
+            rel = float((loss - loss_trial) / (loss + 1e-30))
+            theta, loss = theta_trial, loss_trial
+            lam = max(lam * 0.3, 1e-12)
+            if rel < 1e-9:
                 break
-            prev_loss = loss
 
-        # final params (ensure positivity via softplus)
+        # Evaluate the fitted background over the full k axis
         with torch.no_grad():
-            c = F.softplus(theta[0])
-            i0 = F.softplus(theta[1])
-            s0 = F.softplus(theta[2])
-            i1 = F.softplus(theta[3])
-            s1 = F.softplus(theta[4])
-            # undo normalization
-            c_scaled = c * int_mean
-            i0_scaled = i0 * int_mean
-            i1_scaled = i1 * int_mean
-            # compute bg and the average scattering factor f(k)
-            bg = self._scattering_model_torch(k2, c_scaled, i0_scaled, s0, i1_scaled, s1)
-            f = bg - c_scaled
+            c, i0, s0, i1, s1 = torch.exp(theta).unbind()
+            bg = self._scattering_model_torch(k2, c, i0, s0, i1, s1)
+            f = bg - c
         self.bg = bg
         self.f = f
         return bg, f
@@ -614,13 +739,15 @@ class PairDistributionFunction(AutoSerialize):
                     "mask_realspace must be boolean array of shape "
                     f"({scan_row}, {scan_col})."
                 )
-        # reuse existing radial mean if already computed
-        if self.Ik is not None:
+        # Recompute the radial mean whenever a real-space mask is given (it
+        # selects a different region); only reuse the cache when no mask is
+        # passed -- otherwise calculate_Gr would silently ignore mask_realspace.
+        if self.Ik is not None and mask_bool is None:
             Ik = self.Ik
         else:
             Ik = self.calculate_radial_mean(mask_realspace=mask_bool, returnval=True)
-        # reuse existing background fit if already computed
-        if self.bg is not None and self.f is not None:
+        # Likewise re-fit the background when the region changed.
+        if self.bg is not None and self.f is not None and mask_bool is None:
             bg, f = self.bg, self.f
         else:
             bg, f = self.fit_bg(Ik, self.kmin_fit, self.kmax_fit)
@@ -1254,28 +1381,6 @@ class PairDistributionFunction(AutoSerialize):
         exp2 = torch.clamp((k2**2) / (-2.0 * (s1**4 + eps)), min=-100, max=0)
         # scattering model is monotonic, as is physically expected for backgrounds scattering
         return c + i0 * torch.exp(exp1) + i1 * torch.exp(exp2)
-
-    def _compute_fit_weights(self, k: torch.Tensor, kmin: float, kmax: float) -> torch.Tensor:
-        """
-        Compute weighting tensor for background fitting.
-        Weights downweight low-k region (using sin² taper) and emphasize high-k values.
-        """
-        dk = k[1] - k[0]
-        # DEBUG
-        k_width = kmax - kmin - 0.4
-
-        # sin² taper for low-k suppression
-        mask_low = torch.sin(torch.clamp((k - kmin) / k_width, 0.0, 1.0) * (torch.pi / 2.0)) ** 2
-        # high weight where mask_low is small
-        # later used to divide, so large weights mean small contribution
-        weights = torch.where(
-            mask_low > 1e-4,
-            1.0 / mask_low,
-            torch.tensor(1e6, device=self.device, dtype=k.dtype),
-        )
-        # emphasize high-k values
-        weights = weights * (k[-1] - 0.9 * k + dk)
-        return weights
 
     def _frequency_filtering(
         self,

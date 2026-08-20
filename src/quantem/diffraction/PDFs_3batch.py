@@ -97,17 +97,8 @@ class PDF3B(object):
         dens = positions.shape[0] / volume
 
         ### making big arrays that will be filled
-        natoms_dens = (4 / 3 * xp.pi * hist_r_max**3) * dens
-        maxval_n = int(1.25 * natoms_dens**2)
-        vals = xp.zeros((3, maxval_n * batch_size)).astype("int")
         maxinds = max([len(i) for i in inds_all])
         inds2 = xp.zeros((batch_size, maxinds)).astype("int")
-        if subpixel_weights:
-            weights_full = xp.empty(maxval_n * batch_size)
-            weights = weights_full
-        else:
-            weights_full = None
-            weights = None
 
         if hist_r_max > 15:
             split_bincount = True
@@ -115,6 +106,36 @@ class PDF3B(object):
         else:
             split_bincount = False
             off_inds = xp.where(~xp.eye(maxinds, dtype=bool))
+
+        ### exact upper bound: one entry per (center, pair) in the batch
+        maxval_n = int(off_inds[0].shape[0])
+        vals = xp.zeros((3, maxval_n * batch_size)).astype("int")
+        if subpixel_weights:
+            weights_full = xp.empty(maxval_n * batch_size)
+            weights = weights_full
+        else:
+            weights_full = None
+            weights = None
+
+        # ### making big arrays that will be filled
+        # natoms_dens = (4 / 3 * xp.pi * hist_r_max**3) * dens
+        # maxval_n = int(1.25 * natoms_dens**2)
+        # vals = xp.zeros((3, maxval_n * batch_size)).astype("int")
+        # maxinds = max([len(i) for i in inds_all])
+        # inds2 = xp.zeros((batch_size, maxinds)).astype("int")
+        # if subpixel_weights:
+        #     weights_full = xp.empty(maxval_n * batch_size)
+        #     weights = weights_full
+        # else:
+        #     weights_full = None
+        #     weights = None
+
+        # if hist_r_max > 15:
+        #     split_bincount = True
+        #     off_inds = xp.triu_indices(maxinds, k=1)
+        # else:
+        #     split_bincount = False
+        #     off_inds = xp.where(~xp.eye(maxinds, dtype=bool))
 
         vprint(f"Num total atoms in sim = {len(positions)}")
         if not np.all(pbcs):
@@ -175,15 +196,29 @@ class PDF3B(object):
                 theta_floor = xp.round(theta_ind).astype("int")
 
             good_vals = (r_floor1 > 1e-9) & (r_floor2 > 1e-9) & (theta_floor > 0) & (theta_floor < 180)
-            nvals = good_vals.sum()
-            vals[0, :nvals] = theta_floor[good_vals]
-            vals[1, :nvals] = r_floor2[good_vals]
-            vals[2, :nvals] = r_floor1[good_vals]
+            good_inds = xp.where(good_vals)[0]  # Get the actual indices where good_vals is True
+            nvals = len(good_inds)
+            vals[0, :nvals] = theta_floor[good_inds]
+            vals[1, :nvals] = r_floor2[good_inds]
+            vals[2, :nvals] = r_floor1[good_inds]
             if subpixel_weights:
                 weights_full[:nvals] = (
-                    dtheta_ind[good_vals] + dr_ind2[good_vals] + dr_ind1[good_vals]
+                    dtheta_ind[good_inds] + dr_ind2[good_inds] + dr_ind1[good_inds]
                 ) / 3
                 weights = weights_full[:nvals]
+            # nvals = good_vals.sum()
+
+            # print(f"nvals: {nvals}, theta_floor[good_vals].shape: {theta_floor[good_vals].shape}")
+            # print(f"r_floor2[good_vals].shape: {r_floor2[good_vals].shape}, r_floor1[good_vals].shape: {r_floor1[good_vals].shape}")
+
+            # vals[0, :nvals] = theta_floor[good_vals]
+            # vals[1, :nvals] = r_floor2[good_vals]
+            # vals[2, :nvals] = r_floor1[good_vals]
+            # if subpixel_weights:
+            #     weights_full[:nvals] = (
+            #         dtheta_ind[good_vals] + dr_ind2[good_vals] + dr_ind1[good_vals]
+            #     ) / 3
+            #     weights = weights_full[:nvals]
 
             ### Because taking triu, have to do this twice
             ### and doing bincount twice with half indices seems to be ~10% faster than

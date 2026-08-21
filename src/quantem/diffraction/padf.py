@@ -433,6 +433,111 @@ class PairAngleDistributionFunction(AutoSerialize):
     def _nearest_index(self, x, value):
         return int(np.argmin(np.abs(x - value)))
 
+    def plot_diagonal(
+        self,
+        rmin: float | None = None,
+        rmax: float | None = None,
+        r_display_power: int = 0,
+        r_max_display: float | None = None,
+        r_search_min: float = 0.5,
+        r_marks=None,
+        markers=None,
+        title: str | None = None,
+        figsize: tuple[float, float] = (7, 5),
+        returnfig: bool = False,
+    ):
+        """
+        Plot the r = r' diagonal of the PADF, Theta(r, r, theta), as a 2D map
+        with r on the x-axis (Angstrom) and theta on the y-axis (degrees).
+
+        This is the same quantity plotted by plotting.plot_diagonal(), but with
+        the display treatment used elsewhere in padf.py (plot_g2_g3, plot_theta):
+
+        - Color limits are taken from a quantile of the interior angular range
+        (15-165 deg) only, so the collinear theta = 0 / 180 deg bands (which
+        are typically much larger in magnitude) saturate the colorbar instead
+        of compressing it and hiding the interior angular structure.
+        - A diverging RdBu_r colormap centered at zero is used, since Theta can
+        be positive or negative.
+        - The map can optionally be weighted by r^(2 * r_display_power) to
+        compensate the PADF's natural radial amplitude decay (0 = raw values).
+        - r_marks / markers overlays support annotating known neighbor-shell
+        radii or expected (r, theta) maxima, matching plot_g2_g3's conventions.
+
+        Parameters
+        ----------
+        rmin, rmax : float or None
+            Radial display range (Angstrom). Defaults to [0, r_max_display].
+        r_display_power : int
+            Display weighting exponent; the map is multiplied by
+            r^(2 * r_display_power). 0 plots the raw values.
+        r_max_display : float or None
+            Upper limit of the radial axis if rmax is not given; defaults to
+            min(8 A, r.max()).
+        r_search_min : float
+            Radii below this are excluded when computing the color scale,
+            avoiding r ~ 0 reconstruction artifacts.
+        r_marks : sequence of float or None
+            Radii (e.g. neighbor shell distances) marked with dotted vertical
+            lines.
+        markers : sequence of (r, theta_deg) or (r, theta_deg, size) or None
+            Expected diagonal maxima overlaid as open circles; a third element
+            per tuple scales the marker size (relative multiplicity).
+        title : str or None
+            Figure title; a default is used if None.
+        returnfig : bool
+            Return (fig, ax) instead of calling plt.show().
+        """
+        r = np.asarray(self.r)
+        theta_deg = np.asarray(self.theta_deg)
+        arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
+
+        diag = np.einsum("iik->ik", arr)  # (Nr, Ntheta)
+
+        if r_max_display is None:
+            r_max_display = float(min(8.0, r[-1]))
+        if rmax is None:
+            rmax = r_max_display
+
+        r_mask = self._range_mask(r, rmin, rmax)
+        r_sel = r[r_mask]
+        diag_sel = diag[r_mask, :]  # (Nr_sel, Ntheta)
+
+        weight = r_sel ** (2 * r_display_power)
+        diag_disp = (diag_sel * weight[:, None]).T  # (Ntheta, Nr_sel)
+
+        interior = (theta_deg > 15) & (theta_deg < 165)
+        keep_r = r_sel >= r_search_min
+        sub = diag_disp[np.ix_(interior, keep_r)]
+        vmax = np.quantile(np.abs(sub), 0.999) if sub.size else np.quantile(np.abs(diag_disp), 0.999)
+
+        fig, ax = plt.subplots(figsize=figsize, constrained_layout=True)
+        im = ax.pcolormesh(
+            r_sel, theta_deg, diag_disp,
+            cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
+        )
+        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r, \theta)$", pad=0.02)
+
+        if r_marks is not None:
+            for r_mk in r_marks:
+                ax.axvline(r_mk, color="k", ls=":", lw=0.8)
+
+        if markers is not None:
+            for mk in markers:
+                r_mk, t_mk = mk[0], mk[1]
+                size = 12.0 * (mk[2] ** 0.5) if len(mk) > 2 else 10.0
+                if r_mk <= r_sel[-1]:
+                    ax.plot(r_mk, t_mk, "o", ms=max(size, 5.0), mfc="none", mec="k", mew=1.0)
+
+        ax.set_yticks(np.arange(0, 181, 45))
+        ax.set_xlabel("r = r' (Å)")
+        ax.set_ylabel(r"$\theta$ (degrees)")
+        ax.set_title(title if title is not None else "PADF diagonal", fontsize=10)
+
+        if returnfig:
+            return fig, ax
+        plt.show()
+
     def plot_theta(
         self,
         theta_deg: float,
@@ -569,6 +674,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         if returnfig:
             return fig, ax
         plt.show()
+
+    ########################## OBSOLETE ##########################
 
     def plot_theta_simple(
         self,

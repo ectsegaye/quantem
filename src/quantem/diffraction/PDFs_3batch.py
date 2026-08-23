@@ -48,8 +48,14 @@ class PDF3B(object):
         bbox = xp.array(bbox_np)
         pbcs_np = np.copy(pbcs)
         pbcs = xp.array(pbcs)
-        positions = xp.array(atoms.positions)
         positions_np = np.array(atoms.positions)  # for KD tree
+
+        ### wrap into the cell along periodic dims (KDTree requires 0 <= x < L)
+        for i, p in enumerate(pbcs_np):
+            if p:
+                positions_np[:, i] = np.mod(positions_np[:, i], bbox_np[i])
+                positions_np[positions_np[:, i] >= bbox_np[i], i] = 0.0  # fp edge case
+        positions = xp.array(positions_np)
 
         vprint(f"Cell size (A): {bbox_np}")
         # vprint(f"max dist possible between two points with full pbcs: {np.sqrt(3*(bbox_np.max()/2)**2):.2f} A")
@@ -68,12 +74,7 @@ class PDF3B(object):
         ### KD tree for getting neighbors, cpu cuz faster
         start_KD = time.perf_counter()
         bbox_np_pbcs = bbox_np * pbcs_np
-        if np.any(
-            np.round(positions_np.max(axis=0), 9) >= np.round(bbox_np, 9)
-        ):  # cant have atom right on cell edge
-            for i in range(len(pbcs)):
-                if bbox_np_pbcs[i] != 0:
-                    bbox_np_pbcs += 1e-9
+        bbox_np_pbcs[pbcs_np.astype(bool)] += 1e-9
         tree_all = KDTree(positions_np, copy_data=True, boxsize=bbox_np_pbcs)
         center_inds_skip = center_inds[::skip]
         tree_centers = KDTree(

@@ -587,6 +587,8 @@ class PairAngleDistributionFunction(AutoSerialize):
         markers=None,
         title: str | None = None,
         figsize: tuple[float, float] = (6, 5),
+        labels: bool = True,
+        cbar: bool = True,
         returnfig: bool = False,
     ):
         """
@@ -680,7 +682,8 @@ class PairAngleDistributionFunction(AutoSerialize):
             r_sel, r_sel, slice_disp.T,
             cmap="RdBu_r", vmin=-vmax, vmax=vmax, shading="auto",
         )
-        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r', \theta)$", pad=0.02)
+        if cbar:
+            fig.colorbar(im, ax=ax, label=r"$\Theta(r, r', \theta)$", pad=0.02)
 
         # r = r' reference line
         ax.plot([r_sel[0], r_sel[-1]], [r_sel[0], r_sel[-1]],
@@ -700,8 +703,9 @@ class PairAngleDistributionFunction(AutoSerialize):
                             mfc="none", mec="k", mew=1.0)
 
         ax.set_aspect("equal")
-        ax.set_xlabel("r (Å)")
-        ax.set_ylabel("r' (Å)")
+        if labels:
+            ax.set_xlabel("r (Å)")
+            ax.set_ylabel("r' (Å)")
         ax.set_title(
             title if title is not None
             else rf"$\Theta(r, r', \theta={theta_axis[theta_idx]:.1f}\degree)$",

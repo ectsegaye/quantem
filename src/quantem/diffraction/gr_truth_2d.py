@@ -1,4 +1,6 @@
 """
+Adapted from PDFs_3batch by Arthur McCray (renamed 9/23/2026)
+
 PDF3B with support for 2D (monolayer / coplanar) structures.
 
 Differences from PDFs_3batch.py

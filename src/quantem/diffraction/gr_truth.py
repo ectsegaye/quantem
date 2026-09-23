@@ -1,3 +1,7 @@
+"""
+Adapted from PDFs_3batch by Arthur McCray (renamed 9/23/2026)
+"""
+
 import numpy as np
 import time
 

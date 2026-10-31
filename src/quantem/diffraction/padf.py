@@ -62,13 +62,13 @@ class PairAngleDistributionFunction(AutoSerialize):
         self.padf = self.reconstruct_PADF(self.real_Bl_mats, self.Bl_mats[1], 20) # TODO: determine atoms in beam
     
     def rescale_intensity(self,
-                          data: Polar4dstem | Dataset4dstem | None = None,
+                          data: Polar4dstem | None = None,
                           rho: float | int = 1.0,
                           fq: NDArray | torch.Tensor | float | int | None = None):
         """
-        Equation 7: Take the raw intensity and divide by the following factors
+        Rescale raw intensity by the following factors:
         - Mean number density (rho)
-        - Mean atomic scattering factor squared (f(q)^2)
+        - Mean atomic scattering factor squared (f(q) ** 2)
         - Number of atoms in the beam (N_a)
         - phi_0 (dependent on experimental parameters)
 
@@ -86,6 +86,20 @@ class PairAngleDistributionFunction(AutoSerialize):
         scale.
 
         Handles dtype conversion to float64
+
+        Parameters
+        ----------
+        data : Polar4dstem or None
+            Raw intensities in polar coordinates
+        rho : float or int
+            Mean number density
+        fq : NDArray or torch.Tensor or float or int
+            Mean atomic scattering factor
+
+        Returns
+        -------
+        rescaled_intensity : torch.Tensor
+            4D tensor with rescaled intensity values
         """
 
         intensity = data.tensor.to(dtype=torch.float64)
@@ -104,20 +118,28 @@ class PairAngleDistributionFunction(AutoSerialize):
         rescaled_intensity = intensity / (rho * fq2)
         rescaled_intensity /= rescaled_intensity.mean()
         return rescaled_intensity
-    
-    # phi_0 is not measureable, make a function to fit. (edit: Maybe not necessary)
-    def fit_phi_0(self):
-        pass
-        
 
     def compute_avg_angular_correlation(self, data):
         """
-        Equation 8: angular cross correlation implemented via Fourier correlation theorem
+        Compute average of angular cross-correlations across all patterns in 4D-STEM dataset.
+
+        Finds correlation between a given q, q' and Δphi in diffraction space. Angular cross-
+        correlation for each diffraction pattern is calculated via Fourier correlation theorem
+        rather than direct integral for efficiency. rfft/irfft preferred to fft/ifft assuming
+        Hermitian symmetry.
+
+        Parameters
+        ----------
+        data : 
+
+        Returns
+        -------
+        C_avg : 
         """
 
         scan_row, scan_col, phi, r = data.shape
-        g_all = data.reshape(scan_row * scan_col, phi, r) # Flatten grid of dps to one dimension, makes for loop simpler
-        N_alpha = g_all.shape[0] # Number of dps we have = number of configurations (N_alpha)
+        g_all = data.reshape(scan_row * scan_col, phi, r) # Flatten grid of probe positions to one dimension
+        N_alpha = g_all.shape[0] # Num diffraction patterns = Num configurations (N_alpha)
 
         dphi = 2.0 * torch.pi / phi # A small change in angle
 
@@ -136,11 +158,21 @@ class PairAngleDistributionFunction(AutoSerialize):
         Corrections applied to the angular correlation before B_l extraction,
         matching the pypadf maskcorr.py defaults:
 
-        - subtract_mean: subtract the theta-average from each (q, q') ring,
-          removing the dominant isotropic (uncorrelated) background.
-        - sintheta: multiply by |sin(theta)| (evaluated at bin centers).
-          This is the conversion factor between the correlation function and
-          the PADF (eq 11), applied in q-space as in the pypadf workflow.
+        Parameters
+        ----------
+        C_avg : torch.Tensor
+            Calculated angular correlation function
+        subtract_mean : bool
+            Subtract the theta-average from each (q, q') ring,
+            removing the dominant isotropic (uncorrelated) background.
+        sintheta : bool
+            multiply by |sin(theta)| (evaluated at bin centers).
+            This is the conversion factor between the correlation function and
+            the PADF (eq 11), applied in q-space as in the pypadf workflow.
+
+        Returns
+        -------
+
         """
         C = C_avg.clone()
         Nphi = C.shape[0]
@@ -152,6 +184,14 @@ class PairAngleDistributionFunction(AutoSerialize):
         return C
 
     def extract_Bl_matrices(self, C_avg, l_max=40, sv_cutoff=0.05):
+        """
+        Parameters
+        ----------
+
+        Returns
+        -------
+        """
+
         # Equation 9, 10, 11
         # for each l:
         #     build the linear system relating C to B_l(q, q')
@@ -199,6 +239,12 @@ class PairAngleDistributionFunction(AutoSerialize):
         is dimensionless rather than carrying units of q^6. Combined with
         the unit-mean intensity normalization in rescale_intensity, this
         keeps PADF values of order 1.
+
+        Parameters
+        ----------
+
+        Returns
+        -------
         """
         # Equation 12, 13
         # apply bessel transform twice for each l
@@ -233,6 +279,12 @@ class PairAngleDistributionFunction(AutoSerialize):
 
         NOTE: Theta will go from 0 to pi
         EDIT: Na should be number of atoms not number of dps
+
+        Parameters
+        ----------
+
+        Returns
+        -------
         """
         padf = torch.zeros((real_Bl.shape[1], real_Bl.shape[2], 180), dtype=torch.float64)
         theta = np.linspace(0, np.pi, 180)
@@ -715,44 +767,3 @@ class PairAngleDistributionFunction(AutoSerialize):
         if returnfig:
             return fig, ax
         plt.show()
-
-    ########################## OBSOLETE ##########################
-
-    def plot_theta_simple(
-        self,
-        theta_deg: float,
-        rmin: float | None = None,
-        rmax: float | None = None,
-        figsize: tuple[float, float] = (6, 5),
-        returnfig: bool = False,
-    ):
-        """
-        Plot Theta(r, r', theta) as a 2D map over the full (r, r') grid at a
-        fixed angle theta (degrees), generalizing plot_theta0_map to any theta.
-        """
-        r = self.r
-        theta_axis = self.theta_deg
-
-        padf_arr = self.padf.numpy() if hasattr(self.padf, "numpy") else np.asarray(self.padf)
-        theta_idx = self._nearest_index(theta_axis, theta_deg)
-        slice_2d = padf_arr[:, :, theta_idx]  # (Nr, Nr')
-
-        r_mask = self._range_mask(r, rmin, rmax)
-        r_sel = r[r_mask]
-        slice_2d = slice_2d[np.ix_(r_mask, r_mask)]
-
-        fig, ax = plt.subplots(figsize=figsize)
-        im = ax.pcolormesh(r_sel, r_sel, slice_2d.T, shading="auto")
-        fig.colorbar(im, ax=ax, label=r"$\Theta(r, r', \theta)$")
-
-        ax.set_xlabel("r (Å)")
-        ax.set_ylabel("r' (Å)")
-        ax.set_title(rf"$\Theta(r, r', \theta={theta_axis[theta_idx]:.1f}\degree)$")
-        fig.tight_layout()
-
-        if returnfig:
-            return fig
-        plt.show()
-
-
-
